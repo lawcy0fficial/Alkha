@@ -1,0 +1,94 @@
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+    branches: [ master ]
+
+jobs:
+  build:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python-version: [ 'pypy-2.7', '3.13' ]
+        exclude:
+          - os: macos-latest
+            python-version: 'pypy-2.7'
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Basic import test
+        run: python -c "import sqlmap; import sqlmapapi"
+      - name: Smoke test
+        run: python sqlmap.py --smoke
+      - name: Vuln test
+        run: python sqlmap.py --vuln
+
+  agent-tests:
+    # Everything this fork added on top of stock sqlmap - the AI agent,
+    # NoSQL/Redis/Elasticsearch/CouchDB support, the MCP server, the
+    # security hardening - lives under lib/ai/, lib/nosql/, and
+    # lib/core/tui.py, with its own test suite under lib/ai/tests/
+    # (357 tests as of doc/ALKHA.md's most recent count). The `build`
+    # job above is the original, unmodified sqlmap workflow and only
+    # ever covers the classic engine - it has never run any of this.
+    # Python-3-only (the AI layer's own requirement, unlike the classic
+    # engine's py2.7 compatibility) and Ubuntu-only: this suite needs no
+    # OS-specific behavior the classic engine's matrix exists to catch,
+    # so one fast, reliable job beats stretching the full matrix over
+    # tests that would behave identically on any of them.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v2
+      - name: Set up Python
+        uses: actions/setup-python@v2
+        with:
+          python-version: '3.12'
+      - name: Compile-check every agent/NoSQL/UI module
+        run: |
+          find lib/ai lib/nosql lib/core/tui.py alkha_agent.py alkha_mcp_server.py \
+               -name "*.py" | xargs -I{} python3 -m py_compile {}
+      - name: Start live test targets
+        # these are throwaway in-repo fake servers (lib/ai/tests/live_targets/),
+        # not real third-party services - see doc/ALKHA.md §15/§19/§20/§21 for
+        # why each exists and what it verifies. Backgrounded so they keep
+        # running for the test step below; a short sleep lets every one
+        # finish binding its port before tests start hitting them.
+        #
+        # Output MUST be redirected away from this step's own stdout/stderr
+        # (never left attached, never even piped to `tee`) - an inherited,
+        # un-redirected stdout on a backgrounded process that runs forever
+        # (serve_forever()) keeps that file descriptor open indefinitely,
+        # and the step's shell won't report completion until every
+        # inherited descriptor closes, hanging this step (and the whole
+        # job, until CI's own job-level timeout kills it) even though the
+        # actual commands in this step all return immediately. Confirmed
+        # locally before trusting this in CI: the un-redirected version of
+        # this exact step hung for the tool's full timeout with zero
+        # output; redirecting to log files (discarded here, since nothing
+        # downstream reads them - /dev/null would do the same job but a
+        # real path makes it easy to temporarily inspect while debugging
+        # this step specifically) fixed it immediately.
+        run: |
+          mkdir -p /tmp/live-targets-logs
+          python3 lib/ai/tests/live_targets/operator_injection_target.py 9380 >/tmp/live-targets-logs/sql-operator.log 2>&1 &
+          python3 lib/ai/tests/live_targets/where_injection_target.py 9381 >/tmp/live-targets-logs/sql-where.log 2>&1 &
+          python3 lib/ai/tests/live_targets/fake_redis_server.py 9382 >/tmp/live-targets-logs/redis-open.log 2>&1 &
+          python3 lib/ai/tests/live_targets/fake_redis_server.py 9383 --auth-required >/tmp/live-targets-logs/redis-auth.log 2>&1 &
+          python3 lib/ai/tests/live_targets/fake_elasticsearch_server.py 9384 >/tmp/live-targets-logs/es-open.log 2>&1 &
+          python3 lib/ai/tests/live_targets/fake_elasticsearch_server.py 9385 --auth-required >/tmp/live-targets-logs/es-auth.log 2>&1 &
+          python3 lib/ai/tests/live_targets/fake_couchdb_server.py 9386 >/tmp/live-targets-logs/couch-open.log 2>&1 &
+          python3 lib/ai/tests/live_targets/fake_couchdb_server.py 9387 --auth-required >/tmp/live-targets-logs/couch-auth.log 2>&1 &
+          sleep 2
+      - name: Run the agent/NoSQL/UI test suite
+        run: python3 -m unittest discover -s lib/ai/tests -p "test_*.py" -v
+        env:
+          # the test suite spawns real subprocesses for several tests
+          # (api_bootstrap, the MCP server e2e suite) that each start
+          # their own alkhaapi.py -s on their own port - nothing here
+          # needs network egress beyond 127.0.0.1, so no secrets/tokens
+          # are required for this job.
+          PYTHONUNBUFFERED: '1'
